@@ -1,5 +1,5 @@
 import Queue from "yocto-queue";
-import { slice } from "audio-buffer-utils";
+import { slice } from "audio-buffer-utils"; // TODO: declaration file ts?
 
 export default class LoopStation {
   audioContext: AudioContext;
@@ -37,6 +37,7 @@ export default class LoopStation {
       );
   }
   createMetronome() {
+    // creates an audio buffer containing rotating sine wave and silence set to bpm
     const sampleRate = this.audioContext.sampleRate;
     const samples = this.loopLength * sampleRate;
     const buffer = this.audioContext.createBuffer(1, samples, sampleRate);
@@ -67,6 +68,7 @@ export default class LoopStation {
     return audioTrack;
   }
   adjustSong(bpm: number, beatsPerBar: number, numberOfBars: number) {
+    // used for adjusting tempo/loop length state when editing UI
     this.bpm = bpm;
     this.beatsPerBar = beatsPerBar;
     this.numberOfBars = numberOfBars;
@@ -74,6 +76,7 @@ export default class LoopStation {
     this.loopLength = this.beatLength * beatsPerBar * numberOfBars;
   }
   getNextLoopStart() {
+    // get the next start time for the loop
     const currentTime = this.audioContext.currentTime;
     if (currentTime <= this.startTime) return this.startTime;
     const currentLoopsCompleted = Math.floor(
@@ -84,52 +87,51 @@ export default class LoopStation {
     return nextLoop;
   }
   start() {
+    // reset start time and turn on metronome if enabled
     this.isRunning = true;
     this.startTime = this.audioContext.currentTime; //TODO: Add extra buffer?
     if (this.metronomeOn) this.startMetronome();
   }
   playAll() {
+    // start looper if off and play all recorded audio tracks
     if (!this.isRunning) this.start();
     for (let i = 0; i < this.audioTracks.length; i++) this.playTrack(i);
   }
   stopAll() {
+    // stop metronome and all audio tracks
     this.isRunning = false;
     this.stopMetronome();
     for (let i = 0; i < this.audioTracks.length; i++) this.stopTrack(i);
-    for (const track of this.audioTracks) {
-      console.log(track.schedule);
-    }
   }
   startMetronome() {
-    if (!(this.metronome instanceof AudioTrack)) {
-      throw Error("Metronome not loaded");
-    }
-    this.metronome.scheduler(this.getNextLoopStart(), this.loopLength);
+    this.metronome.scheduleLoop(this.getNextLoopStart(), this.loopLength);
   }
   stopMetronome() {
-    if (!(this.metronome instanceof AudioTrack)) {
-      throw Error("Metronome not loaded");
-    }
-    this.metronome.stopScheduler();
+    this.metronome.stopLoop();
   }
   playTrack(trackIndex: number) {
+    // play and loop given audio track (starts at next loop start currently)
+    // TODO: Start immediately?
     const audioTrack = this.audioTracks[trackIndex];
     if (!audioTrack.buffer) return;
     if (!this.isRunning) this.start();
-    audioTrack.scheduler(this.getNextLoopStart(), this.loopLength);
+    audioTrack.scheduleLoop(this.getNextLoopStart(), this.loopLength);
   }
   stopTrack(trackIndex: number) {
+    // stop given audio track and any queued loops
     const audioTrack = this.audioTracks[trackIndex];
-    audioTrack.stopScheduler();
+    audioTrack.stopLoop();
   }
   recordTrack(trackIndex: number) {
+    // record audio track (starting at next loop) then begin playing loop
     const audioTrack = this.audioTracks[trackIndex];
-    console.log(audioTrack);
     const recorder = new MediaRecorder(this.microphoneStream);
     if (!this.isRunning) this.start();
     if (audioTrack.intervalId) this.stopTrack(trackIndex);
     const startLoop = this.getNextLoopStart();
+
     const waitTime = startLoop - this.audioContext.currentTime;
+    console.log(startLoop, waitTime);
     recorder.start();
     setTimeout(
       () => recorder.stop(),
@@ -139,28 +141,21 @@ export default class LoopStation {
       const array = await ev.data.arrayBuffer();
       const audio = await this.audioContext.decodeAudioData(array);
       audioTrack.buffer = audio;
-      const startSample =
-        (waitTime + this.audioContext.outputLatency) *
-        this.audioContext.sampleRate;
+      if (!this.audioContext.outputLatency) {
+        console.error("Output latency not detected, synchonization may be off");
+      }
+      const latency =
+        this.audioContext.outputLatency ?? this.audioContext.baseLatency;
+      const startSample = (waitTime + latency) * this.audioContext.sampleRate;
       const endSample =
         startSample + this.loopLength * this.audioContext.sampleRate;
-      const sliced = slice(
-        audio,
-        (waitTime + this.audioContext.outputLatency) *
-          this.audioContext.sampleRate,
-      );
+      const sliced = slice(audio, startSample, endSample);
       audioTrack.buffer = sliced;
 
-      const startTime = startLoop + this.loopLength;
-      const firstRun = audioTrack.createSource(); // first playback is offset to catch first loop
-      firstRun.start(
+      audioTrack.scheduleOne(
         this.audioContext.currentTime,
-        this.audioContext.currentTime - startTime,
+        startLoop + this.loopLength,
       );
-      audioTrack.schedule.enqueue(firstRun);
-      firstRun.addEventListener("ended", () => audioTrack.schedule.dequeue(), {
-        once: true,
-      });
       this.playTrack(trackIndex);
     });
   }
@@ -194,13 +189,18 @@ class AudioTrack {
     this.nextTime = 0;
   }
   createSource() {
+    // create new source buffer node and conenct to audio chain
+    // reason: source can only be started once
     if (!this.buffer) throw Error("No buffer found");
     const source = this.audioContext.createBufferSource();
     source.buffer = this.buffer;
     source.connect(this.gain);
     return source;
   }
-  scheduler(startTime: number, length: number) {
+  scheduleLoop(startTime: number, length: number) {
+    // loop audio track starting from startTime
+    // stays one queued audio source ahead of playback to prevent
+    // timing issues
     if (this.intervalId) throw Error("Already playing");
     this.nextTime = startTime;
     const addToQueue = () => {
@@ -216,7 +216,19 @@ class AudioTrack {
     addToQueue();
     this.intervalId = setInterval(addToQueue, length * 1000);
   }
-  stopScheduler() {
+  scheduleOne(startTime: number, startOffset: number) {
+    // play one playthrough of audio track from startOffset (in seconds)
+    // beginning at startTime
+    const firstRun = this.createSource();
+    firstRun.start(startTime, startOffset);
+    this.schedule.enqueue(firstRun);
+    firstRun.addEventListener("ended", () => this.schedule.dequeue(), {
+      once: true,
+    });
+  }
+  stopLoop() {
+    // immediately muted gain node, stop interval, and disconnect
+    // all queued source nodes
     const previousGain = this.gain.gain.value;
     this.gain.gain.value = 0;
     if (this.intervalId) clearInterval(this.intervalId);
@@ -225,55 +237,5 @@ class AudioTrack {
     }
     this.intervalId = null;
     this.gain.gain.value = previousGain;
-  }
-}
-
-class Metronome {
-  scheduled: Queue<[OscillatorNode, GainNode]>;
-  audioContext: AudioContext;
-  isPlaying: boolean;
-  intervalId: ReturnType<typeof setInterval> | null;
-  intervalTime: number;
-  nextBeat: number;
-  constructor(audioContext: AudioContext) {
-    this.audioContext = audioContext;
-    this.scheduled = new Queue();
-    this.isPlaying = false;
-    this.intervalId = null;
-    this.intervalTime = 500;
-    this.nextBeat = audioContext.currentTime;
-  }
-  scheduleBeep(time: number) {
-    const oscillator = this.audioContext.createOscillator();
-    const gain = this.audioContext.createGain();
-    oscillator.frequency.value = 700;
-    gain.gain.value = 1;
-    oscillator.connect(gain);
-    gain.connect(this.audioContext.destination);
-    gain.gain.exponentialRampToValueAtTime(1, time + 0.001);
-    gain.gain.exponentialRampToValueAtTime(0.001, time + 0.02);
-    oscillator.start(time);
-    oscillator.stop(time + 0.03);
-    oscillator.addEventListener("ended", () => {
-      this.scheduled.dequeue();
-    });
-    this.scheduled.enqueue([oscillator, gain]);
-  }
-  play(startTime: number, beatLength: number) {
-    this.scheduleBeep(startTime);
-    this.isPlaying = true;
-    this.nextBeat = startTime + beatLength;
-    this.intervalId = setInterval(() => {
-      if (this.scheduled.size < 4) {
-        this.scheduleBeep(this.nextBeat);
-        this.nextBeat += beatLength;
-      }
-    }, this.intervalTime);
-  }
-  stop() {
-    for (const [, gain] of this.scheduled.drain()) {
-      gain.disconnect();
-    }
-    if (this.intervalId !== null) clearInterval(this.intervalId);
   }
 }
