@@ -111,11 +111,12 @@ export default class LoopStation {
   }
   playTrack(trackIndex: number) {
     // play and loop given audio track (starts at next loop start currently)
-    // TODO: Start immediately?
+    // TODO: Start immediately? Or next loop
     const audioTrack = this.audioTracks[trackIndex];
     if (!audioTrack.buffer) return;
     if (!this.isRunning) this.start();
     audioTrack.scheduleLoop(this.getNextLoopStart(), this.loopLength);
+    // TODO: Might need to run one truncated playthrough before loop, see extra buffer for start
   }
   stopTrack(trackIndex: number) {
     // stop given audio track and any queued loops
@@ -131,7 +132,6 @@ export default class LoopStation {
     const startLoop = this.getNextLoopStart();
 
     const waitTime = startLoop - this.audioContext.currentTime;
-    console.log(startLoop, waitTime);
     recorder.start();
     setTimeout(
       () => recorder.stop(),
@@ -140,7 +140,6 @@ export default class LoopStation {
     recorder.addEventListener("dataavailable", async (ev) => {
       const array = await ev.data.arrayBuffer();
       const audio = await this.audioContext.decodeAudioData(array);
-      audioTrack.buffer = audio;
       if (!this.audioContext.outputLatency) {
         console.error("Output latency not detected, synchonization may be off");
       }
@@ -151,10 +150,10 @@ export default class LoopStation {
         startSample + this.loopLength * this.audioContext.sampleRate;
       const sliced = slice(audio, startSample, endSample);
       audioTrack.buffer = sliced;
-
+      if (!audioTrack.buffer) throw Error("No audio buffer");
       audioTrack.scheduleOne(
         this.audioContext.currentTime,
-        startLoop + this.loopLength,
+        audioTrack.getStartOffset(this.getNextLoopStart()),
       );
       this.playTrack(trackIndex);
     });
@@ -237,5 +236,15 @@ class AudioTrack {
     }
     this.intervalId = null;
     this.gain.gain.value = previousGain;
+  }
+  getStartOffset(nextLoopStart: number) {
+    // return start offset for the buffer so that buffer ends a nextLoopStart
+    if (!this.buffer) {
+      throw Error(`No audio buffer found for track: ${this.id}`);
+    }
+    const offset =
+      this.buffer.duration - (nextLoopStart - this.audioContext.currentTime);
+    console.log(offset);
+    return offset;
   }
 }
